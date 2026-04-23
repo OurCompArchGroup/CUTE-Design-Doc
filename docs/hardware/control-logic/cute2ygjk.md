@@ -1,61 +1,71 @@
-# RoCC 接口
+# YGJK / RoCC 接口
 
 ## 1. 术语说明
 
 | 术语 | 说明 |
 |------|------|
-| RoCC | Rocket Custom Coprocessor，Rocket 的协处理器接口协议 |
-| CUTE2YGJK | CUTE异构接口， RoCC 协议适配模块 |
-| TileLink | RISC-V 芯片内互连总线协议 |
-| funct | RoCC 指令中的功能码字段 |
+| YGJKControl | CUTE 顶层控制通道，包含 `amuCtrl` 与 `mrelease` |
+| Cute2TL | TileLink 客户端封装，负责 MMU 请求到 TL 请求的适配 |
+| CUTE2TLImp | `Cute2TL` 的具体实现模块，维护 SourceID busy 表与收发仲裁 |
+| MMU2TLIO | CUTE 内部 MMU 与 TL 适配层之间的请求/响应接口 |
+| Source ID | TileLink 并发事务标识，用于请求-响应匹配和 in-flight 跟踪 |
 
 ## 2. 设计规格
 
 | 参数 | 说明 |
 |------|------|
-| 指令接口 | RoCC（Rocket Custom Coprocessor） |
-| 备选接口 | CSR（用于非 RoCC 平台如香山） |
-| 数据宽度 | 64 bit（RoCC 寄存器宽度） |
-| 地址宽度 | 64 bit |
-| TileLink 位宽 | 可配置（`outsideDataWidth`，默认 512 bit） |
+| 控制接口 | `YGJKControl`（`amuCtrl` 输入、`mrelease` 输出） |
+| 访存适配 | `Cute2TL/CUTE2TLImp`（TL Client） |
+| Source ID 空间 | `0 ~ LLCSourceMaxNum-1` |
+| 请求类型 | `Get/Put`（由 `RequestType_isWrite` 选择） |
+| TL 用户域 | `MatrixKey`、`AmeIndex`（按请求类型与矩阵类型赋值） |
 
 ## 3. 功能描述
 
-CUTE2YGJK 是 CUTE 与 CPU 之间的协议适配层，将 CPU 发出的 RoCC 指令转换为 CUTE 内部控制信号。
+CUTE 控制路径由两部分组成：
+1. **控制通道**：`YGJKControl` 将 AMU 控制指令送入 TaskController，并接收 release 反馈。
+2. **访存适配通道**：`Cute2TL` 将 `MMU2TLIO` 请求映射到 TileLink `A` 通道，并将 `D` 通道响应回填。
 
-### 3.1 指令分发
+### 3.1 控制通道（`YGJKControl`）
 
-RoCC 指令的 `funct` 字段决定指令类型：
+当前实现中，控制接口字段为：
+- `amuCtrl: Decoupled[AmuCtrlIO]`（输入到 TC）
+- `mrelease: Valid[MreleaseIO]`（TC 回传）
 
-| funct 范围 | 目标 | 说明 |
-|-----------|------|------|
-| 0-63 | 状态查询处理器 | 状态查询指令（直接 RoCC 响应） |
-| ≥64 | CUTE 内部命令 | 取低 6 位作为内部 funct（0-18） |
+在顶层连接中：
+```scala
+io.ctrl2top <> TaskCtrl.io.ygjkctrl
+```
 
-### 3.2 状态查询指令
+该路径直接驱动 TaskController 的解码与发射，不再使用原版宏指令配置寄存器流程作为现行主路径。
 
-| funct | 名称 | 说明 |
-|-------|------|------|
-| 1 | QueryAcceleratorBusy | 查询加速器是否忙碌 |
-| 2 | QueryRuntime | 查询运行时间 |
-| 3 | QueryMemReadCount | 查询内存读次数 |
-| 4 | QueryMemWriteCount | 查询内存写次数 |
-| 5 | QueryComputeTime | 查询计算时间 |
-| 6 | QueryMacroInstFinish | 查询宏指令完成数 |
-| 7 | QueryMacroInstFIFOFull | 查询宏指令 FIFO 是否已满 |
-| 8 | QueryMacroInstFIFOInfo | 查询 FIFO 详细信息 |
+### 3.2 MMU 请求分发（`MMU2TLIO -> TL A`）
 
-### 3.3 CUTE 内部命令
+`CUTE2TLImp` 根据 `io.mmu.Request` 生成 TL 请求：
+- `RequestType_isWrite==0`：发 `Get`
+- `RequestType_isWrite==1`：发 `Put`
 
-| 内部 funct | 名称 | 说明 |
-|-----------|------|------|
-| 0 | SEND_MACRO_INST | 发送宏指令（触发计算） |
-| 1-4 | CONFIG_TENSOR_A/B/C/D | 配置张量地址和步长 |
-| 5 | CONFIG_TENSOR_DIM | 配置张量维度 |
-| 6 | CONFIG_CONV_PARAMS | 配置卷积参数（数据类型、bias、转置等） |
-| 7-8 | CONFIG_SCALE_A/B | 配置缩放因子地址 |
-| 16 | CLEAR_INST | 清除指令 |
-| 17 | QUERY_INST | 内部查询 |
+同时维护 TL user 字段：
+- `MatrixKey`：由 `MatrixIsAcc` 与读写方向决定
+- `AmeIndex`：写入当前分配的 SourceID
+
+请求可发条件：
+- `!is_full`（SourceID 未耗尽）
+- 下游 `tl_out.a.ready`
+
+### 3.3 响应回传与仲裁（`TL D` + `matrix_data_in`）
+
+XSAI 版本支持两路响应合流：
+- `tl_out.d`（TL 返回）
+- `matrix_data_in`（外部矩阵数据返回通道）
+
+仲裁策略：
+- `matrix_data_in` 优先级高于 `tl_out.d`。
+- 同拍同时有效时，保证 `matrix_data_in` 优先 fire，`tl_out.d` 延后。
+
+任一路响应 fire 后：
+- 根据 `source` 清除对应 `busy(source)`。
+- 响应数据回填 `io.mmu.Response`。
 
 ## 4. 微架构设计
 
@@ -63,65 +73,59 @@ RoCC 指令的 `funct` 字段决定指令类型：
 
 | 组件 | 功能 |
 |------|------|
-| `RoCC2CUTE` | RoCC 命令解码，分发到查询/计算路径 |
-| `Cute2TL` | TileLink Master 适配器，处理内存访问 |
-| `CUTE2TLImp` | LazyModule 实现，连接到 TileLink 总线 |
-| `CUTETile` | 包装 CUTEV2Top + RoCC 接口的顶层模块 |
+| `YGJKControl` | 控制指令输入（`amuCtrl`）与 release 输出（`mrelease`） |
+| `TaskController` | AMU uop 解码、准入、发射、完成回传 |
+| `Cute2TL` | TL Client 节点封装 |
+| `CUTE2TLImp` | SourceID 分配、A/D 通道收发、响应回传 |
 
 ### 4.2 Source ID 管理
 
-- 维护 in-flight TileLink 事务的 Source ID 映射
-- 一致性请求和非一致性请求使用不同的 ID 范围
-- 响应通过 Source ID 匹配路由回正确的请求方
+`CUTE2TLImp` 使用 `busy: Vec[Bool]` 跟踪 in-flight 请求：
+1. 扫描 `busy` 找空闲 ID，输出 `ConherentRequsetSourceID.bits`。
+2. `tl_out.a.fire` 后置位 `busy(id)=true`。
+3. `matrix_data_in.fire || tl_out.d.fire` 后清除 `busy(source)=false`。
+4. `is_full = busy.reduce(_ & _)` 时不再分配新 ID。
+
+该机制保证并发请求有界，并支持响应按 SourceID 精确回收。
 
 ## 5. 接口寄存器
 
-| 字段 | 类型 | 说明 |
+当前 XSAI 实装不采用原版“配置寄存器组”作为主控制接口，主要接口如下：
+
+| 接口/字段 | 类型 | 说明 |
 |------|------|------|
-| {M, N, K} | uint32 | 矩阵维度 |
-| Base{A, B, Bias, C} | uint64 | 内存基地址 |
-| Stride{A, B, Bias, C} | uint32 | 内存步长 |
-| DataType | enum | 数据精度 |
-| BiasType | enum | Bias 类型（Zero/Row-Repeat/Full） |
-| Transpose | bool | 结果转置标志 |
-| Status | uint32 | 异步操作状态 |
+| `YGJKControl.amuCtrl` | Decoupled | 上游下发 AMU 控制指令 |
+| `YGJKControl.mrelease` | Valid | TC 回传 release token |
+| `MMU2TLIO.Request` | Decoupled | MMU 发起读写请求 |
+| `MMU2TLIO.Response` | Decoupled | MMU 接收读写响应 |
+| `ConherentRequsetSourceID` | Valid | 当前可分配 coherent SourceID |
 
 ## 6. 编程模型
 
-CUTE 的异步编程模型仅需两类指令：
+当前控制流程按“uop 流 + 异步完成回传”工作：
+1. 上游向 `amuCtrl` 推送 AMU uop。
+2. TaskController 逐条解码并发射到 load/compute/store 路径。
+3. 各子模块通过 `MicroTaskEndValid` 回传完成事件，TC 更新依赖状态。
+4. release 指令由 TC 通过 `mrelease` 返回上游。
 
-```c
-// 异步发起矩阵乘法
-asyncMatMul(M, N, K, BaseA, BaseB, BaseC, BaseD, ...);
-
-// 同步等待完成
-checkMatmul();
-
-// 查询状态
-status = queryAcceleratorBusy();
-```
-
-**矩阵-向量交叠执行模式：**
-
-```c
-asyncMatMul(TILE_M, TILE_N, K, ...);     // tile 0
-for (i=1; i<num_tiles; i++) {
-    asyncMatMul(TILE_M, TILE_N, K, ...); // tile i
-    checkMatmul();                        // 等待 tile i-1 完成
-    // 向量单元处理 tile i-1 的 epilogue
-}
-checkMatmul();                            // 等待最后一个 tile
-```
+访存路径由 MMU 发起，Cute2TL 负责 TL 事务适配和并发 SourceID 管理。
 
 ## 7. 与其他模块的交互
 
 ```
-CPU ──RoCC──→ CUTE2YGJK ──RoCCControl──→ TaskController
-                  │
-                  └──Cute2TL──→ TileLink Bus ──→ LLC/DRAM
+上游控制
+   │ (YGJKControl.amuCtrl)
+   ▼
+TaskController ───────────► 各执行/访存子模块
+   │
+   └── mrelease ─────────► 上游控制
+
+LocalMMU/MMU2TLIO ──► Cute2TL(CUTE2TLImp) ──► TileLink
+                                ▲
+                                └── matrix_data_in / tl_out.d 响应合流
 ```
 
 ## 8. 参考
-
-- 源码：`src/main/scala/CUTE2YGJK.scala`、`src/main/scala/config_ygjk.scala`
-- 论文：CUTE v2 (DAC 2026) — Section 3 Architecture Overview
+- 源码：`src/main/scala/CUTE2YGJK.scala`
+- 控制接口：`src/main/scala/config_ygjk.scala`
+- 顶层连接：`src/main/scala/CUTETOP.scala`

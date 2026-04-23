@@ -76,6 +76,7 @@ nav:
       - 控制逻辑:
           - hardware/control-logic/index.md
           - 指令译码与调度: hardware/control-logic/task-controller.md
+          - Scoreboard 依赖检查: hardware/control-logic/scoreboard.md
           - 硬件参数配置: hardware/control-logic/cute-parameters.md
           - YGJK / RoCC 接口: hardware/control-logic/cute2ygjk.md
       - 集成方案:
